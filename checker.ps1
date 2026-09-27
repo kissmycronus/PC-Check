@@ -109,8 +109,6 @@ function Scan-USBDevices {
     if ($XimFound) {
         Add-Content -Path $outputFile -Value "`n[Xim Matrix Found]"
     }
-    
-    # Don't return the hashtable to prevent it from being logged
 }
 
 function Get-OneDrivePath {
@@ -189,8 +187,8 @@ function Find-SusFiles {
     $susFilesHeader = "`n-----------------`nSus Files:`n"
     $susFiles = @()
 
-    # Regex for 6+ alphanumeric executable names (case-insensitive by default)
-    $pattern = '^[A-Za-z0-9]{6,}\.exe$'
+    # Regex for 7+ alphanumeric executable names (case-insensitive by default)
+    $pattern = '^[A-Za-z0-9]{7,}\.exe$'
 
     # Directories to search (you can expand this list)
     $searchPaths = @("C:\Users", "C:\Program Files", "C:\Program Files (x86)", "C:\Windows\Temp", "C:\Temp")
@@ -222,20 +220,129 @@ function Find-SusFiles {
 
 
 function Log-BrowserFolders {
-    Write-Host "Logging reg entries inside PowerShell..." -ForegroundColor DarkYellow
-    $registryPath = "HKLM:\SOFTWARE\Clients\StartMenuInternet"
+    Write-Host "Checking for installed browsers..." -ForegroundColor DarkYellow
+
     $desktopPath = [System.Environment]::GetFolderPath('Desktop')
-    $outputFile = Join-Path -Path $desktopPath -ChildPath $logFileName
-    if (Test-Path $registryPath) {
-        $browserFolders = Get-ChildItem -Path $registryPath
-        Add-Content -Path $outputFile -Value "`n-----------------"
-        Add-Content -Path $outputFile -Value "`nBrowser Folders:"
-        foreach ($folder in $browserFolders) { 
-            Add-Content -Path $outputFile -Value $folder.Name 
-        }
-    } else {
-        Write-Host "Registry path for browsers not found." -ForegroundColor Red
+    $outputFile  = Join-Path -Path $desktopPath -ChildPath $logFileName
+
+    # Browsers we care about: DisplayName -> match patterns
+    $targetBrowsers = @(
+        @{ Name = "Google Chrome";        Patterns = @("Google Chrome") },
+        @{ Name = "Microsoft Edge";       Patterns = @("Microsoft Edge") },
+        @{ Name = "Mozilla Firefox";      Patterns = @("Mozilla Firefox", "Firefox") },
+        @{ Name = "Opera GX";             Patterns = @("Opera GX") },
+        @{ Name = "Brave";                Patterns = @("Brave") },
+        @{ Name = "DuckDuckGo Browser";   Patterns = @("DuckDuckGo") },
+        @{ Name = "Helium";               Patterns = @("Helium") },
+        @{ Name = "Mullvad Browser";      Patterns = @("Mullvad Browser", "Mullvad") }
+    )
+
+    # ------------------------------------------------------------------
+    # 1) Gather installed applications from registry uninstall keys
+    # ------------------------------------------------------------------
+    $uninstallPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $installedApps = @()
+    foreach ($path in $uninstallPaths) {
+        try {
+            $installedApps += Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+                              Where-Object { $_.DisplayName } |
+                              Select-Object DisplayName, DisplayVersion, InstallLocation, Publisher
+        } catch {}
     }
+
+    # ------------------------------------------------------------------
+    # 2) Also check common install folders (in case registry is missing)
+    # ------------------------------------------------------------------
+    $installFolders = @(
+        "$env:ProgramFiles",
+        "${env:ProgramFiles(x86)}",
+        "$env:LocalAppData"
+    )
+
+    $folderHints = @{
+        "Google Chrome"      = @("Google\Chrome\Application")
+        "Microsoft Edge"     = @("Microsoft\Edge\Application")
+        "Mozilla Firefox"    = @("Mozilla Firefox")
+        "Opera GX"           = @("Programs\Opera GX", "Opera GX")
+        "Brave"              = @("BraveSoftware\Brave-Browser\Application", "Brave")
+        "DuckDuckGo Browser" = @("DuckDuckGo", "Programs\DuckDuckGo")
+        "Helium"             = @("Helium", "Programs\Helium")
+        "Mullvad Browser"    = @("Mullvad Browser", "Programs\Mullvad Browser")
+    }
+
+    # ------------------------------------------------------------------
+    # 3) Evaluate each target browser - only log if found
+    # ------------------------------------------------------------------
+    $linesToWrite = @()
+    foreach ($browser in $targetBrowsers) {
+        $matchesFound = @()
+
+        # Registry matches
+        foreach ($app in $installedApps) {
+            foreach ($pat in $browser.Patterns) {
+                if ($app.DisplayName -like "*$pat*") {
+                    $line = "  {0} - Version: {1}" -f $app.DisplayName, ($app.DisplayVersion)
+                    if ($app.InstallLocation) { $line += ", Path: $($app.InstallLocation)" }
+                    if ($app.Publisher)       { $line += ", Publisher: $($app.Publisher)" }
+                    if ($matchesFound -notcontains $line) { $matchesFound += $line }
+                }
+            }
+        }
+
+        # Folder matches
+        if ($folderHints.ContainsKey($browser.Name)) {
+            foreach ($root in $installFolders) {
+                if (-not (Test-Path $root)) { continue }
+                foreach ($hint in $folderHints[$browser.Name]) {
+                    $candidate = Join-Path -Path $root -ChildPath $hint
+                    if (Test-Path $candidate) {
+                        $line = "  {0} (folder) - Path: {1}" -f $browser.Name, $candidate
+                        if ($matchesFound -notcontains $line) { $matchesFound += $line }
+                    }
+                }
+            }
+        }
+
+        # Only add to output if at least one match was found
+        if ($matchesFound.Count -gt 0) {
+            $linesToWrite += ("{0}: INSTALLED" -f $browser.Name)
+            foreach ($m in $matchesFound) {
+                $linesToWrite += $m
+            }
+        }
+    }
+
+    # Write the browser section only if something was found
+    if ($linesToWrite.Count -gt 0) {
+        Add-Content -Path $outputFile -Value "`n-----------------"
+        Add-Content -Path $outputFile -Value "`nInstalled Browsers:"
+        foreach ($line in $linesToWrite) {
+            Add-Content -Path $outputFile -Value $line
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # 4) StartMenuInternet registry - only list entries, only if any exist
+    # ------------------------------------------------------------------
+    $startMenuPath = "HKLM:\SOFTWARE\Clients\StartMenuInternet"
+    if (Test-Path $startMenuPath) {
+        try {
+            $browserFolders = Get-ChildItem -Path $startMenuPath -ErrorAction SilentlyContinue
+            if ($browserFolders -and $browserFolders.Count -gt 0) {
+                Add-Content -Path $outputFile -Value "`nRegistered StartMenuInternet Browsers:"
+                foreach ($folder in $browserFolders) {
+                    Add-Content -Path $outputFile -Value ("  {0}" -f $folder.Name)
+                }
+            }
+        } catch { }
+    }
+
+    Write-Host "Installed browser info logged in $logFileName" -ForegroundColor Green
 }
 
 function List-BAMStateUserSettings {
@@ -755,6 +862,10 @@ if (Test-Path $logFilePath) {
     try {
         Set-Clipboard -Value (Get-Content -Path $logFilePath -Raw) -ErrorAction SilentlyContinue
         Write-Host "Log file copied to clipboard." -ForegroundColor DarkRed
+
+        # Delete the log file from the Desktop after copying to clipboard
+        Remove-Item -Path $logFilePath -Force -ErrorAction SilentlyContinue
+        Write-Host "Log file deleted from Desktop." -ForegroundColor DarkRed
     } catch {
         Write-Host "Failed to copy log file to clipboard." -ForegroundColor Red
     }
