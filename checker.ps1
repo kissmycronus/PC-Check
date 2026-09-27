@@ -179,45 +179,6 @@ function Find-RarAndExeFiles {
     }
 }
 
-function Find-SusFiles {
-    Write-Output "Searching for suspiciously named files..."
-
-    $desktopPath = [System.Environment]::GetFolderPath('Desktop')
-    $outputFile = Join-Path -Path $desktopPath -ChildPath $logFileName
-    $susFilesHeader = "`n-----------------`nSus Files:`n"
-    $susFiles = @()
-
-    # Regex for 7+ alphanumeric executable names (case-insensitive by default)
-    $pattern = '^[A-Za-z0-9]{7,}\.exe$'
-
-    # Directories to search (you can expand this list)
-    $searchPaths = @("C:\Users", "C:\Program Files", "C:\Program Files (x86)", "C:\Windows\Temp", "C:\Temp")
-
-    foreach ($path in $searchPaths) {
-        if (Test-Path $path) {
-            try {
-                $files = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue
-
-                foreach ($file in $files) {
-                    if ($file.Name -match $pattern -or $file.Name -ieq "Dapper.dll") {
-                        $susFiles += $file.FullName
-                    }
-                }
-            } catch {
-                Write-Output ("Error searching path '{0}': {1}" -f $path, $_.Exception.Message)
-            }
-        }
-    }
-
-    if ($susFiles.Count -gt 0) {
-        Add-Content -Path $outputFile -Value $susFilesHeader
-        $susFiles | Sort-Object | ForEach-Object { Add-Content -Path $outputFile -Value $_ }
-        Write-Output "Suspicious files logged in $logFileName."
-    } else {
-        Write-Output "No suspicious files found."
-    }
-}
-
 
 function Log-BrowserFolders {
     Write-Host "Checking for installed browsers..." -ForegroundColor DarkYellow
@@ -225,16 +186,21 @@ function Log-BrowserFolders {
     $desktopPath = [System.Environment]::GetFolderPath('Desktop')
     $outputFile  = Join-Path -Path $desktopPath -ChildPath $logFileName
 
-    # Browsers we care about: DisplayName -> match patterns
+    # Browsers we care about.
+    # Each entry:
+    #   Name        -> canonical display name written to the log
+    #   Patterns    -> substrings matched against the registry DisplayName
+    #   Exclude     -> substrings that must NOT appear in the registry DisplayName
+    #   FolderHints -> relative paths under Program Files / Program Files (x86) / LocalAppData
     $targetBrowsers = @(
-        @{ Name = "Google Chrome";        Patterns = @("Google Chrome") },
-        @{ Name = "Microsoft Edge";       Patterns = @("Microsoft Edge") },
-        @{ Name = "Mozilla Firefox";      Patterns = @("Mozilla Firefox", "Firefox") },
-        @{ Name = "Opera GX";             Patterns = @("Opera GX") },
-        @{ Name = "Brave";                Patterns = @("Brave") },
-        @{ Name = "DuckDuckGo Browser";   Patterns = @("DuckDuckGo") },
-        @{ Name = "Helium";               Patterns = @("Helium") },
-        @{ Name = "Mullvad Browser";      Patterns = @("Mullvad Browser", "Mullvad") }
+        @{ Name = "Google Chrome";      Patterns = @("Google Chrome");                  Exclude = @("WebView");  FolderHints = @("Google\Chrome\Application") },
+        @{ Name = "Microsoft Edge";     Patterns = @("Microsoft Edge");                 Exclude = @("WebView");  FolderHints = @("Microsoft\Edge\Application") },
+        @{ Name = "Mozilla Firefox";    Patterns = @("Mozilla Firefox", "Firefox");     Exclude = @();           FolderHints = @("Mozilla Firefox") },
+        @{ Name = "Opera GX";           Patterns = @("Opera GX");                       Exclude = @();           FolderHints = @("Programs\Opera GX", "Opera GX") },
+        @{ Name = "Brave";              Patterns = @("Brave");                          Exclude = @();           FolderHints = @("BraveSoftware\Brave-Browser\Application", "Brave") },
+        @{ Name = "DuckDuckGo Browser"; Patterns = @("DuckDuckGo");                     Exclude = @();           FolderHints = @("DuckDuckGo", "Programs\DuckDuckGo") },
+        @{ Name = "Helium";             Patterns = @("Helium");                         Exclude = @();           FolderHints = @("Helium", "Programs\Helium") },
+        @{ Name = "Mullvad Browser";    Patterns = @("Mullvad Browser");                Exclude = @("VPN");      FolderHints = @("Mullvad Browser", "Programs\Mullvad Browser") }
     )
 
     # ------------------------------------------------------------------
@@ -256,7 +222,7 @@ function Log-BrowserFolders {
     }
 
     # ------------------------------------------------------------------
-    # 2) Also check common install folders (in case registry is missing)
+    # 2) Common install folders (fallback if registry is missing)
     # ------------------------------------------------------------------
     $installFolders = @(
         "$env:ProgramFiles",
@@ -264,82 +230,58 @@ function Log-BrowserFolders {
         "$env:LocalAppData"
     )
 
-    $folderHints = @{
-        "Google Chrome"      = @("Google\Chrome\Application")
-        "Microsoft Edge"     = @("Microsoft\Edge\Application")
-        "Mozilla Firefox"    = @("Mozilla Firefox")
-        "Opera GX"           = @("Programs\Opera GX", "Opera GX")
-        "Brave"              = @("BraveSoftware\Brave-Browser\Application", "Brave")
-        "DuckDuckGo Browser" = @("DuckDuckGo", "Programs\DuckDuckGo")
-        "Helium"             = @("Helium", "Programs\Helium")
-        "Mullvad Browser"    = @("Mullvad Browser", "Programs\Mullvad Browser")
-    }
-
     # ------------------------------------------------------------------
-    # 3) Evaluate each target browser - only log if found
+    # 3) Determine which browsers are installed (name-only output)
     # ------------------------------------------------------------------
-    $linesToWrite = @()
+    $detectedBrowsers = @()
     foreach ($browser in $targetBrowsers) {
-        $matchesFound = @()
+        $isInstalled = $false
 
-        # Registry matches
+        # Registry check
         foreach ($app in $installedApps) {
+            $nameMatch = $false
             foreach ($pat in $browser.Patterns) {
-                if ($app.DisplayName -like "*$pat*") {
-                    $line = "  {0} - Version: {1}" -f $app.DisplayName, ($app.DisplayVersion)
-                    if ($app.InstallLocation) { $line += ", Path: $($app.InstallLocation)" }
-                    if ($app.Publisher)       { $line += ", Publisher: $($app.Publisher)" }
-                    if ($matchesFound -notcontains $line) { $matchesFound += $line }
-                }
+                if ($app.DisplayName -like "*$pat*") { $nameMatch = $true; break }
             }
+            if (-not $nameMatch) { continue }
+
+            $excluded = $false
+            foreach ($ex in $browser.Exclude) {
+                if ($app.DisplayName -like "*$ex*") { $excluded = $true; break }
+            }
+            if ($excluded) { continue }
+
+            $isInstalled = $true
+            break
         }
 
-        # Folder matches
-        if ($folderHints.ContainsKey($browser.Name)) {
+        # Folder check (only if not already found)
+        if (-not $isInstalled) {
             foreach ($root in $installFolders) {
                 if (-not (Test-Path $root)) { continue }
-                foreach ($hint in $folderHints[$browser.Name]) {
+                foreach ($hint in $browser.FolderHints) {
                     $candidate = Join-Path -Path $root -ChildPath $hint
                     if (Test-Path $candidate) {
-                        $line = "  {0} (folder) - Path: {1}" -f $browser.Name, $candidate
-                        if ($matchesFound -notcontains $line) { $matchesFound += $line }
+                        $isInstalled = $true
+                        break
                     }
                 }
+                if ($isInstalled) { break }
             }
         }
 
-        # Only add to output if at least one match was found
-        if ($matchesFound.Count -gt 0) {
-            $linesToWrite += ("{0}: INSTALLED" -f $browser.Name)
-            foreach ($m in $matchesFound) {
-                $linesToWrite += $m
-            }
+        if ($isInstalled) {
+            $detectedBrowsers += $browser.Name
         }
     }
 
-    # Write the browser section only if something was found
-    if ($linesToWrite.Count -gt 0) {
+    # Only write the section if at least one browser was found
+    if ($detectedBrowsers.Count -gt 0) {
         Add-Content -Path $outputFile -Value "`n-----------------"
         Add-Content -Path $outputFile -Value "`nInstalled Browsers:"
-        foreach ($line in $linesToWrite) {
-            Add-Content -Path $outputFile -Value $line
+        foreach ($b in $detectedBrowsers) {
+            Add-Content -Path $outputFile -Value $b
         }
-    }
-
-    # ------------------------------------------------------------------
-    # 4) StartMenuInternet registry - only list entries, only if any exist
-    # ------------------------------------------------------------------
-    $startMenuPath = "HKLM:\SOFTWARE\Clients\StartMenuInternet"
-    if (Test-Path $startMenuPath) {
-        try {
-            $browserFolders = Get-ChildItem -Path $startMenuPath -ErrorAction SilentlyContinue
-            if ($browserFolders -and $browserFolders.Count -gt 0) {
-                Add-Content -Path $outputFile -Value "`nRegistered StartMenuInternet Browsers:"
-                foreach ($folder in $browserFolders) {
-                    Add-Content -Path $outputFile -Value ("  {0}" -f $folder.Name)
-                }
-            }
-        } catch { }
     }
 
     Write-Host "Installed browser info logged in $logFileName" -ForegroundColor Green
@@ -455,38 +397,6 @@ function Search-PrefetchFiles {
     }
 }
 
-function Log-LogitechScripts {
-    Write-Host "Logging Logitech scripts..." -ForegroundColor DarkYellow
-    $desktopPath = [System.Environment]::GetFolderPath('Desktop')
-    $outputFile = Join-Path -Path $desktopPath -ChildPath $logFileName
-    $logitechScriptsHeader = "`n-----------------`nLogitech Scripts:`n"
-    Add-Content -Path $outputFile -Value $logitechScriptsHeader
-    
-    $scriptsPath = Join-Path -Path $env:LocalAppData -ChildPath "LGHUB\scripts"
-    
-    if (Test-Path -Path $scriptsPath) {
-        try {
-            $scriptFiles = Get-ChildItem -Path $scriptsPath -Recurse -File -ErrorAction Stop
-
-            if ($scriptFiles -and $scriptFiles.Count -gt 0) {
-                foreach ($file in $scriptFiles) {
-                    Add-Content -Path $outputFile -Value ("{0} - Last Modified: {1}" -f $file.FullName, $file.LastWriteTime)
-                }
-            } else {
-                Add-Content -Path $outputFile -Value "No script files found."
-            }
-        } catch {
-            Write-Host "Could not retrieve Logitech scripts." -ForegroundColor Red
-            Add-Content -Path $outputFile -Value "Logitech Scripts: Retrieval failed."
-        }
-    } else {
-        Write-Host "Logitech scripts directory not found." -ForegroundColor Red
-        Add-Content -Path $outputFile -Value "Logitech Scripts: Directory not found."
-    }
-
-    Write-Host "Logitech scripts in $logFileName" -ForegroundColor Green
-}
-
 function Log-WindowsSecurityStatus {
     Write-Host "Logging Windows Security status..." -ForegroundColor DarkYellow
     $desktopPath = [System.Environment]::GetFolderPath('Desktop')
@@ -587,7 +497,7 @@ function Log-ProtectionHistory {
 }
 
 function Log-SystemInfo {
-    Write-Host "Logging System Info: Secure Boot and Kernel DMA Protection status..." -ForegroundColor DarkYellow
+    Write-Host "Logging System Info: Secure Boot status..." -ForegroundColor DarkYellow
     $desktopPath = [System.Environment]::GetFolderPath('Desktop')
     $outputFile = Join-Path -Path $desktopPath -ChildPath $logFileName
     $systemInfoHeader = "`n-----------------`nSystem Info:`n"
@@ -606,49 +516,8 @@ function Log-SystemInfo {
         Write-Host "Could not retrieve Secure Boot status." -ForegroundColor Red
         Add-Content -Path $outputFile -Value "Secure Boot: Unknown (retrieval failed)"
     }
-    
-    try {
-        # Check Kernel DMA Protection status
-        $dmaProtectionStatus = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableDmaProtection" -ErrorAction SilentlyContinue
-        if ($dmaProtectionStatus -and $dmaProtectionStatus.EnableDmaProtection -eq 1) {
-            Add-Content -Path $outputFile -Value "Kernel DMA Protection: Enabled"
-        } else {
-            Add-Content -Path $outputFile -Value "Kernel DMA Protection: Disabled or not supported"
-        }
-    } catch {
-        Write-Host "Could not retrieve Kernel DMA Protection status." -ForegroundColor Red
-        Add-Content -Path $outputFile -Value "Kernel DMA Protection: Unknown (retrieval failed)"
-    }
 
     Write-Host "System Info logged in $logFileName" -ForegroundColor Green
-}
-
-function Find-RegistrySubkeys {
-    Write-Output "Checking registry subkeys..."
-    $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DmaSecurity\AllowedBuses"
-    $desktopPath = [System.Environment]::GetFolderPath('Desktop')
-    $outputFile = Join-Path -Path $desktopPath -ChildPath $logFileName
-    $registryOutputHeader = "`n-----------------`nRegistry Keys under AllowedBuses:`n"
-    Add-Content -Path $outputFile -Value $registryOutputHeader
-    
-    if (Test-Path -Path $registryPath) {
-        try {
-            $subkeys = Get-ChildItem -Path $registryPath -ErrorAction Stop
-            if ($subkeys.Count -eq 0) {
-                Add-Content -Path $outputFile -Value "No subkeys found (only default key exists)."
-            } else {
-                $subkeys | ForEach-Object {
-                    Add-Content -Path $outputFile -Value $_.PSChildName
-                }
-            }
-        } catch {
-            Add-Content -Path $outputFile -Value "Error accessing registry path."
-        }
-    } else {
-        Add-Content -Path $outputFile -Value "Registry path not found."
-    }
-
-    Write-Output "Registry keys have been logged to $outputFile"
 }
 
 # Main execution
@@ -836,17 +705,14 @@ function Log-R6AndSteamBanStatus {
     }
 }
 
-# Execute all functions including the new USB scan
+# Execute all functions (Find-SusFiles, Find-RegistrySubkeys, and Log-LogitechScripts removed)
 List-BAMStateUserSettings
 Log-WindowsInstallDate
 Find-RarAndExeFiles
-Find-SusFiles
 Search-PrefetchFiles
 Log-WindowsSecurityStatus
 Log-ProtectionHistory
 Log-SystemInfo
-Find-RegistrySubkeys
-Log-LogitechScripts
 Log-MonitorsEDID
 Log-PCIeDevices
 Log-R6AndSteamBanStatus
@@ -862,10 +728,6 @@ if (Test-Path $logFilePath) {
     try {
         Set-Clipboard -Value (Get-Content -Path $logFilePath -Raw) -ErrorAction SilentlyContinue
         Write-Host "Log file copied to clipboard." -ForegroundColor DarkRed
-
-        # Delete the log file from the Desktop after copying to clipboard
-        Remove-Item -Path $logFilePath -Force -ErrorAction SilentlyContinue
-        Write-Host "Log file deleted from Desktop." -ForegroundColor DarkRed
     } catch {
         Write-Host "Failed to copy log file to clipboard." -ForegroundColor Red
     }
